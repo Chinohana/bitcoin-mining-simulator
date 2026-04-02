@@ -34,44 +34,44 @@
 
 ## 系统要求
 
+⚠️ **平台限制**: 本程序**仅支持 Windows 平台**，且必须使用 **MSVC 编译器**。
+
 ### 硬件要求
 - **CPU**: x86_64 架构处理器
-- **推荐**: 支持 Intel SHA 扩展的 CPU (Intel Goldmont 或更新架构)
+- **推荐**: 支持 Intel SHA 扩展和 AVX2 指令集的 CPU (Intel Goldmont 或更新架构)
 
 ### 软件要求
-- **编译器**: 支持 C++11 或更高版本
-  - GCC / Clang (Linux/macOS)
-  - MSVC (Windows)
-- **操作系统**: Windows / Linux / macOS
+- **操作系统**: Windows 10/11
+- **编译器**: Microsoft Visual C++ (MSVC)
+- **开发环境**: Visual Studio 或 Visual Studio Build Tools
 
 ## 编译方法
 
-### Windows (MSVC)
+### Windows (MSVC) - 唯一支持的编译方式
+
+使用以下命令进行编译（启用全程序优化和 AVX2 指令集）：
 
 ```bash
-cl /O2 /std:c++17 mining_sim.cpp
+cl /O2 /Ot /GL /Ob2 /arch:AVX2 /GS- /utf-8 /EHsc mining_sim.cpp /link /LTCG
 ```
 
-### Linux (GCC)
+#### 编译参数说明
 
-```bash
-g++ -O3 -std=c++17 -pthread mining_sim.cpp -o mining_sim
-```
+| 参数 | 说明 |
+|------|------|
+| `/O2` | 最大速度优化 |
+| `/Ot` | 内联函数优化 |
+| `/GL` | 全程序优化 (配合 `/LTCG`) |
+| `/Ob2` | 激进内联扩展 |
+| `/arch:AVX2` | 启用 AVX2 指令集 |
+| `/GS-` | 禁用安全检查 (提升性能) |
+| `/utf-8` | 使用 UTF-8 编码 |
+| `/EHsc` | 启用 C++ 异常处理 |
+| `/link /LTCG` | 链接时全程序优化 |
 
-### macOS (Clang)
+### 其他平台
 
-```bash
-clang++ -O3 -std=c++17 -pthread mining_sim.cpp -o mining_sim
-```
-
-### 启用 Intel SHA 优化 (可选)
-
-如果确认 CPU 支持 SHA 指令集，可以添加相应编译选项：
-
-```bash
-# GCC/Clang
-g++ -O3 -std=c++17 -pthread -msse4 -msha mining_sim.cpp -o mining_sim
-```
+❌ **不支持** Linux、macOS 或其他编译器 (GCC/Clang)。
 
 ## 使用方法
 
