@@ -175,6 +175,10 @@ Hash: 0000abcd...
 
 本项目采用 MIT 许可证。详见 [LICENSE](LICENSE) 文件。
 
+## 致谢
+
+- **SHA-Intrinsics**: `sha256-ni.hpp` 基于 [https://github.com/noloader/SHA-Intrinsics](https://github.com/noloader/SHA-Intrinsics) 的代码实现。
+
 ## 参考资料
 
 - [比特币协议文档](https://en.bitcoin.it/wiki/Protocol_documentation)
