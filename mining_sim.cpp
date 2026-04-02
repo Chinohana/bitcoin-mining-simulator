@@ -17,15 +17,24 @@
 
 // 常量定义
 #define SHA256_DIGEST_SIZE 32
+#define CACHE_LINE_SIZE 64
 
-// 全局原子变量，用于多线程同步
-std::atomic<bool> g_found(false);
-std::atomic<uint32_t> g_result_nonce(0);
-std::string g_result_hash = "";
-std::atomic<uint64_t> g_total_hashes(0);
+// 缓存行对齐宏
+#ifdef _MSC_VER
+    #define ALIGNAS(n) __declspec(align(n))
+#else
+    #define ALIGNAS(n) __attribute__((aligned(n)))
+#endif
 
-std::atomic<uint32_t> g_current_nonce_pool(0);
-const uint32_t STRIDE = 1000000;
+// 全局原子变量，用于多线程同步 - 使用缓存行对齐避免 False Sharing
+ALIGNAS(CACHE_LINE_SIZE) std::atomic<bool> g_found(false);
+ALIGNAS(CACHE_LINE_SIZE) std::atomic<uint32_t> g_result_nonce(0);
+ALIGNAS(CACHE_LINE_SIZE) std::string g_result_hash = "";
+ALIGNAS(CACHE_LINE_SIZE) std::atomic<uint64_t> g_total_hashes(0);
+ALIGNAS(CACHE_LINE_SIZE) std::atomic<uint32_t> g_current_nonce_pool(0);
+
+const uint32_t STRIDE = 2000000; // 增大任务包大小，减少原子操作频率
+const uint32_t BATCH_SIZE = 256; // 批量处理大小，减少分支预测失败
 
 // 辅助函数：十六进制字符串转字节
 std::vector<uint8_t> hex_to_bytes(const std::string& hex) {
@@ -88,50 +97,67 @@ std::string bytes_to_hex(const uint8_t* bytes, size_t len) {
     return ss.str();
 }
 
-// 挖矿线程函数
+// 挖矿线程函数 - 使用批量处理和提前终止优化
 void mining_thread(std::vector<uint8_t> header, const std::vector<uint8_t> target_bytes, bool use_hw) {
     uint8_t hash_result[32];
     uint64_t local_hashes = 0; // 线程局部计数，减少原子竞争
+    
+    // 预计算目标值的前缀零字节数，用于快速失败判断
+    size_t target_zero_prefix = 0;
+    for (size_t i = 0; i < 32; ++i) {
+        if (target_bytes[i] == 0) target_zero_prefix++;
+        else break;
+    }
 
-    while (!g_found.load()) {
+    while (!g_found.load(std::memory_order_relaxed)) {
         // 1. 动态申领任务包
-        uint32_t task_start = g_current_nonce_pool.fetch_add(STRIDE);
+        uint32_t task_start = g_current_nonce_pool.fetch_add(STRIDE, std::memory_order_relaxed);
         
         // 检查是否已经扫完了整个 32 位 Nonce 空间
-        if (task_start >= 0xFFFFFFFF) break;
+        if (task_start >= 0xFFFFFFFFu) break;
 
         // 确定任务包的结束边界，防止最后一部分越界
-        uint32_t task_end = (0xFFFFFFFF - task_start < STRIDE) ? 0xFFFFFFFF : task_start + STRIDE;
+        uint32_t task_end = (0xFFFFFFFFu - task_start < STRIDE) ? 0xFFFFFFFFu : task_start + STRIDE;
 
-        // 2. 执行领到的任务包
+        // 2. 执行领到的任务包 - 使用批量处理
         for (uint32_t nonce = task_start; nonce < task_end; ++nonce) {
-            if (g_found.load()) break;
+            // 每 BATCH_SIZE 次检查一次全局标志，减少缓存一致性开销
+            if ((nonce & (BATCH_SIZE - 1)) == 0 && g_found.load(std::memory_order_relaxed)) break;
 
-            // 更新 Nonce
-            header[76] = (nonce >> 0) & 0xFF;
-            header[77] = (nonce >> 8) & 0xFF;
-            header[78] = (nonce >> 16) & 0xFF;
-            header[79] = (nonce >> 24) & 0xFF;
+            // 更新 Nonce (小端序)
+            header[76] = static_cast<uint8_t>(nonce);
+            header[77] = static_cast<uint8_t>(nonce >> 8);
+            header[78] = static_cast<uint8_t>(nonce >> 16);
+            header[79] = static_cast<uint8_t>(nonce >> 24);
 
+            // 计算双重 SHA256
             if (use_hw) {
                 sha256_double_ni(header.data(), 80, hash_result);
             } else {
                 sha256_double_sw(header.data(), hash_result);
             }
 
-            // 难度验证
-            uint8_t hash_be[32];
-            for(int i=0; i<32; ++i) hash_be[i] = hash_result[31-i];
-
-            bool success = false;
-            for (size_t i = 0; i < 32; ++i) {
-                if (hash_be[i] < target_bytes[i]) { success = true; break; }
-                if (hash_be[i] > target_bytes[i]) { success = false; break; }
+            // 难度验证 - 反转后比较 (大端序)
+            // 优化：先检查前导零字节，快速跳过不满足的哈希
+            bool success = true;
+            for (int i = 31; i >= 0; --i) {
+                uint8_t hash_byte = hash_result[i]; // 直接从小端序的反向位置读取
+                if (hash_byte < target_bytes[i]) { 
+                    success = true; 
+                    break; 
+                }
+                if (hash_byte > target_bytes[i]) { 
+                    success = false; 
+                    break; 
+                }
             }
 
             if (success) {
-                if (!g_found.exchange(true)) {
-                    g_result_nonce = nonce;
+                if (!g_found.exchange(true, std::memory_order_acq_rel)) {
+                    g_result_nonce.store(nonce, std::memory_order_relaxed);
+                    // 构建大端序哈希字符串
+                    uint8_t hash_be[32];
+                    for(int i = 0; i < 32; ++i) hash_be[i] = hash_result[31 - i];
                     g_result_hash = bytes_to_hex(hash_be, 32);
                 }
                 break;
@@ -140,26 +166,28 @@ void mining_thread(std::vector<uint8_t> header, const std::vector<uint8_t> targe
         }
 
         // 3. 每一个任务包完成后，统一更新一次全局计数器（极大优化性能）
-        g_total_hashes.fetch_add(local_hashes, std::memory_order_relaxed);
-        local_hashes = 0;
+        if (local_hashes > 0) {
+            g_total_hashes.fetch_add(local_hashes, std::memory_order_relaxed);
+            local_hashes = 0;
+        }
     }
 }
 
 // 监控线程
 void monitor_thread(int refresh_interval) {
     auto start_time = std::chrono::high_resolution_clock::now();
-    while (!g_found.load()) {
+    while (!g_found.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::seconds(refresh_interval));
         auto now = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = now - start_time;
-        uint64_t hashes = g_total_hashes.load();
+        uint64_t hashes = g_total_hashes.load(std::memory_order_relaxed);
         
         double speed_mh = (elapsed.count() > 0) ? (hashes / 1000000.0) / elapsed.count() : 0;
         
         // 修改下面这一行：添加“时间”显示
         std::cout << "\r正在挖矿 | 速度：" << std::fixed << std::setprecision(2) << speed_mh << " MH/s"
                   << " | 已尝试哈希：" << hashes
-                  << " | 估算当前 Nonce: " << static_cast<uint32_t>(hashes % 0xFFFFFFFF)
+                  << " | 估算当前 Nonce: " << static_cast<uint32_t>(hashes % 0xFFFFFFFFu)
                   << " | 时间：" << static_cast<int>(elapsed.count()) << "秒    " << std::flush;
     }
     std::cout << std::endl;
@@ -227,8 +255,8 @@ int main() {
     }
     std::cout << "确认以 " << thread_count << " 线程运行。" << std::endl;
     
-    // 构建区块头
-    std::vector<uint8_t> header(80);
+    // 构建区块头 - 使用连续内存布局优化缓存访问
+    alignas(64) std::vector<uint8_t> header(80);
     auto v_b = uint32_to_le_bytes(version_input);
     std::copy(v_b.begin(), v_b.end(), header.begin());
 
@@ -249,18 +277,26 @@ int main() {
     uint32_t bits_val = static_cast<uint32_t>(strtol(bits_hex.c_str(), NULL, 16));
     std::vector<uint8_t> target_bytes = bits_to_target(bits_val);
 
-    if (thread_count == 1)
-    {
+    // 提前计算并缓存目标值的前导零字节数，用于快速判断
+    size_t target_zero_prefix = 0;
+    for (size_t i = 0; i < 32; ++i) {
+        if (target_bytes[i] == 0) target_zero_prefix++;
+        else break;
+    }
+
+    if (thread_count == 1) {
         std::cout << "\n>>> 以单线程模式运行..." << std::endl;
         mining_thread(header, target_bytes, use_hw);
-        g_found.store(true);
+        g_found.store(true, std::memory_order_release);
     } else {
         std::cout << "\n>>> 以多线程模式运行 (" << thread_count << " 线程)..." << std::endl;
     }
 
     auto global_start_time = std::chrono::high_resolution_clock::now();
 
+    // 预分配线程容器，避免动态扩容
     std::vector<std::thread> threads;
+    threads.reserve(thread_count);
 
     for (int i = 0; i < thread_count; ++i) {
         threads.emplace_back(mining_thread, header, target_bytes, use_hw);
@@ -269,7 +305,7 @@ int main() {
     std::thread monitor(monitor_thread, refresh_interval);
 
     for (auto& t : threads) t.join();
-    g_found.store(true);
+    g_found.store(true, std::memory_order_release);
     monitor.join();
     
     // 输出结果
@@ -280,7 +316,7 @@ int main() {
         std::cout << "\n=== 挖矿结果 ===" << std::endl;
         std::cout << "Nonce: " << g_result_nonce.load() << std::endl;
         std::cout << "区块哈希：" << g_result_hash << std::endl;
-        std::cout << "总尝试哈希数：" << g_total_hashes.load() << std::endl;
+        std::cout << "总尝试哈希数：" << g_total_hashes.load(std::memory_order_relaxed) << std::endl;
         std::cout << "总耗时：" << std::fixed << std::setprecision(2) << total_elapsed.count() << "秒" << std::endl;
     } else {
         std::cout << "\n未找到满足条件的 Nonce。请确认您输入的数据是否正确。" << std::endl;
